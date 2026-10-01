@@ -1,0 +1,15 @@
+
+==============================================================
+  BACKTEST: Dual CE+PE Momentum Strategy
+  Replay harvested tick data through strategy engine
+==============================================================
+  Log: backtest_logs\backtest_2026-09-02_07-51-34.log
+
+  ── Strategy Settings ──
+  Trail tiers: 0.0:5.0, 3.0:4.0, 5.0:3.0, 8.0:3.0, 12.0:2.0, 18.0:2.0, 25.0:3.0
+  BEV trigger: 2.0% │ BEV buffer: ₹1.0
+  Wide stop: 25.0%
+  Time: 09:15 → 15:30
+  Opt margin: 5 │ Fut margin: 10
+
+  Edit settings? [n]: 
