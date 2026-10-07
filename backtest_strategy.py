@@ -1,3 +1,4 @@
+import time
 """
 Backtest: Dual CE+PE Momentum Strategy on Harvested Data
 =========================================================
@@ -41,7 +42,12 @@ class TeeLogger:
 
     def write(self, message):
         self.terminal.write(message)
-        self.log_file.write(message)
+        if message.strip():
+            import datetime
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            self.log_file.write(f"[{ts}] {message}")
+        else:
+            self.log_file.write(message)
 
     def flush(self):
         self.terminal.flush()
@@ -682,6 +688,68 @@ def find_data_dirs(base_dir="live_data"):
 def scan_instruments(day_dir):
     """Scan a day's directory and categorize instruments into CE/PE/FUT/INDEX.
     Handles both flat layout and subfolder layout (BANKNIFTY/, NIFTY/, SENSEX/)."""
+    
+    # Fast path: use _metadata.json if available (avoids reading 930 files)
+    meta_path = os.path.join(day_dir, "_metadata.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as mf:
+                meta = json.load(mf)
+            inst_map = meta.get("instruments", {})
+            if inst_map:
+                instruments = {}
+                for inst_key, description in inst_map.items():
+                    parts = description.split()
+                    if len(parts) < 2: continue
+                    underlying = parts[0]
+                    strike_kind = parts[1]
+                    expiry = parts[2] if len(parts) >= 3 else ""
+                    
+                    if strike_kind == "FUT":
+                        kind = "FUT"
+                        strike = ""
+                    elif strike_kind.endswith("CE"):
+                        kind = "CE"
+                        strike = strike_kind[:-2]
+                    elif strike_kind.endswith("PE"):
+                        kind = "PE"
+                        strike = strike_kind[:-2]
+                    else:
+                        continue
+                    
+                    fname = None
+                    for ext in ['.parquet', '.jsonl']:
+                        for base in [day_dir, os.path.join(day_dir, underlying)]:
+                            candidate = os.path.join(base, inst_key + ext)
+                            if os.path.exists(candidate):
+                                fname = candidate
+                                break
+                        if fname: break
+                    
+                    if not fname: continue
+                    
+                    try:
+                        if fname.endswith('.parquet'):
+                            import pyarrow.parquet as pq
+                            tick_count = pq.read_metadata(fname).num_rows
+                        else:
+                            tick_count = max(1, os.path.getsize(fname) // 800)
+                    except:
+                        tick_count = 0
+                    
+                    instruments[inst_key] = {
+                        "path": fname, "fname": os.path.basename(fname),
+                        "key": inst_key, "name": description, "kind": kind,
+                        "underlying": underlying, "strike": strike,
+                        "expiry": expiry, "tick_count": tick_count,
+                    }
+                
+                if instruments:
+                    print(f"  Loaded {len(instruments)} instruments from _metadata.json (fast)")
+                    return instruments
+        except Exception as e:
+            print(f"  ⚠ _metadata.json failed ({e}), scanning files...")
+
     instruments = {}
 
     # Collect JSONL files from root AND subdirectories
@@ -1174,7 +1242,6 @@ def run_trend_backtest(ce_file, pe_file, fut_file, ce_info, pe_info, fut_info,
         "ce_trades": ce_trader.trades, "pe_trades": pe_trader.trades,
         "ce_pnl": ce_pnl, "pe_pnl": pe_pnl, "total_pnl": total_pnl,
         "total_trades": total_trades, "total_wins": total_wins,
-        "config": f"Trail: {trail_tiers} │ BEV: {bev_trigger}%/{bev_buffer}₹ │ Wide: {straight_down_pct}% │ FutLimit: {fut_move_limit}",
         "fut_ref_price": ce_strat.fut_ref_price,
     }
 
@@ -1282,6 +1349,11 @@ def run_backtest(ce_file, pe_file, fut_file, ce_info, pe_info, fut_info,
                         entry_was = call_trader.entry_price
                         call_trader.sell(ltp, ts, peak=call_trader.peak_price,
                                          bev=False, wide=False, trail=True)
+                        # Reset strategy state so it can buy again
+                        call_strat._in_position = False; call_strat.entry_price = None
+                        call_strat.peak_price = None; call_strat.stop_loss = None
+                        call_strat._breakeven_active = False; call_strat._breakeven_stop = None
+                        call_strat._sell_minute = ts[11:16] if len(ts) > 15 else None
                         if not quiet:
                             print(f"  ✓ CE TARGET HIT +{target_profit}%: entry={entry_was:.0f} exit={ltp:.0f} P&L=+{ltp-entry_was:.0f}")
                         continue
@@ -1295,6 +1367,10 @@ def run_backtest(ce_file, pe_file, fut_file, ce_info, pe_info, fut_info,
                         if held >= max_hold:
                             call_trader.sell(ltp, ts, peak=call_trader.peak_price,
                                              bev=False, wide=False, trail=False)
+                            call_strat._in_position = False; call_strat.entry_price = None
+                            call_strat.peak_price = None; call_strat.stop_loss = None
+                            call_strat._breakeven_active = False; call_strat._breakeven_stop = None
+                            call_strat._sell_minute = ts[11:16] if len(ts) > 15 else None
                             continue
                     except: pass
                 signal = call_strat.on_option_tick(ltp, ts, data)
@@ -1303,12 +1379,7 @@ def run_backtest(ce_file, pe_file, fut_file, ce_info, pe_info, fut_info,
                     if side_filter == "PE":
                         call_strat._in_position = False; call_strat.entry_price = None; call_strat.peak_price = None; call_strat.stop_loss = None
                         continue
-                    if min_premium > 0 and ltp < min_premium:
-                        call_strat._in_position = False; call_strat.entry_price = None; call_strat.peak_price = None; call_strat.stop_loss = None
-                        continue
-                    if max_premium > 0 and ltp > max_premium:
-                        call_strat._in_position = False; call_strat.entry_price = None; call_strat.peak_price = None; call_strat.stop_loss = None
-                        continue
+                    # Premium check removed — handled by pre-filter at day start
                     if first_only and ce_first_traded:
                         call_strat._in_position = False; call_strat.entry_price = None; call_strat.peak_price = None; call_strat.stop_loss = None
                         continue
@@ -1379,6 +1450,10 @@ def run_backtest(ce_file, pe_file, fut_file, ce_info, pe_info, fut_info,
                         entry_was = put_trader.entry_price
                         put_trader.sell(ltp, ts, peak=put_trader.peak_price,
                                         bev=False, wide=False, trail=True)
+                        put_strat._in_position = False; put_strat.entry_price = None
+                        put_strat.peak_price = None; put_strat.stop_loss = None
+                        put_strat._breakeven_active = False; put_strat._breakeven_stop = None
+                        put_strat._sell_minute = ts[11:16] if len(ts) > 15 else None
                         if not quiet:
                             print(f"  ✓ PE TARGET HIT +{target_profit}%: entry={entry_was:.0f} exit={ltp:.0f} P&L=+{ltp-entry_was:.0f}")
                         continue
@@ -1392,6 +1467,10 @@ def run_backtest(ce_file, pe_file, fut_file, ce_info, pe_info, fut_info,
                         if held >= max_hold:
                             put_trader.sell(ltp, ts, peak=put_trader.peak_price,
                                             bev=False, wide=False, trail=False)
+                            put_strat._in_position = False; put_strat.entry_price = None
+                            put_strat.peak_price = None; put_strat.stop_loss = None
+                            put_strat._breakeven_active = False; put_strat._breakeven_stop = None
+                            put_strat._sell_minute = ts[11:16] if len(ts) > 15 else None
                             continue
                     except: pass
                 signal = put_strat.on_option_tick(ltp, ts, data)
@@ -1400,12 +1479,7 @@ def run_backtest(ce_file, pe_file, fut_file, ce_info, pe_info, fut_info,
                     if side_filter == "CE":
                         put_strat._in_position = False; put_strat.entry_price = None; put_strat.peak_price = None; put_strat.stop_loss = None
                         continue
-                    if min_premium > 0 and ltp < min_premium:
-                        put_strat._in_position = False; put_strat.entry_price = None; put_strat.peak_price = None; put_strat.stop_loss = None
-                        continue
-                    if max_premium > 0 and ltp > max_premium:
-                        put_strat._in_position = False; put_strat.entry_price = None; put_strat.peak_price = None; put_strat.stop_loss = None
-                        continue
+                    # Premium check removed — handled by pre-filter at day start
                     if first_only and pe_first_traded:
                         put_strat._in_position = False; put_strat.entry_price = None; put_strat.peak_price = None; put_strat.stop_loss = None
                         continue
@@ -1651,63 +1725,83 @@ def find_combos(instruments):
 # MAIN — interactive backtest runner
 # ═══════════════════════════════════════════════════════════════
 
-def _parallel_worker(combo_dict):
-    """Module-level worker for ProcessPoolExecutor. Receives all args as a dict."""
-    import json
-    combo = combo_dict["combo"]
-    args_dict = combo_dict["args"]
+def _process_one_day(day_work):
+    """Process ALL combos for one day in a single worker process."""
+    import time
+    t0 = time.time()
+    date_str = day_work["date"]
+    day_path = day_work["day_path"]
+    args_dict = day_work["args"]
+    combos = day_work["combos"]
+    trail_tiers_str = args_dict.get("trail_tiers", "")
     
     # Reconstruct trail tiers
-    trail_tiers = args_dict.get("trail_tiers")
-    if trail_tiers and isinstance(trail_tiers, str):
-        trail_tiers = [(float(x.split(',')[0]), float(x.split(',')[1])) for x in trail_tiers.split(';')]
-    elif trail_tiers and isinstance(trail_tiers, list):
-        trail_tiers = [(float(a), float(b)) for a, b in trail_tiers]
+    if trail_tiers_str and isinstance(trail_tiers_str, str):
+        trail_tiers = [(float(x.split(',')[0]), float(x.split(',')[1])) for x in trail_tiers_str.split(';')]
+    else:
+        trail_tiers = [(0,8),(10,6),(20,5),(30,4)]
     
-    # Auto-detect fut_move_limit
-    fml = args_dict.get("fut_move_limit", -1)
-    if fml < 0:
-        underlying = combo.get("underlying", "").upper()
-        if "BANKNIFTY" in underlying or "BANKEX" in underlying:
-            fml = 200
+    results = []
+    for combo in combos:
+        # Auto-detect fut_move_limit
+        fml = args_dict.get("fut_move_limit", -1)
+        if fml < 0:
+            ul = combo.get("underlying", "").upper()
+            fml = 200 if ("BANKNIFTY" in ul or "BANKEX" in ul) else 75
+        
+        # Determine per-underlying premium
+        ul = combo.get("underlying", "").upper()
+        if ("BANKNIFTY" in ul or "BANKEX" in ul):
+            mn = args_dict.get("bnf_min_premium", 0) or args_dict.get("min_premium", 0)
+            mx = args_dict.get("bnf_max_premium", 0) or args_dict.get("max_premium", 0)
+        elif "BANK" not in ul:
+            mn = args_dict.get("nif_min_premium", 0) or args_dict.get("min_premium", 0)
+            mx = args_dict.get("nif_max_premium", 0) or args_dict.get("max_premium", 0)
         else:
-            fml = 75
+            mn = args_dict.get("min_premium", 0)
+            mx = args_dict.get("max_premium", 0)
+        
+        result = run_backtest(
+            combo["ce_path"], combo["pe_path"], combo["fut_path"],
+            combo["ce_info"], combo["pe_info"], combo["fut_info"],
+            opt_low_margin=args_dict.get("opt_margin", 5),
+            fut_low_margin=args_dict.get("fut_margin", 10),
+            trail_tiers=trail_tiers,
+            max_trades=args_dict.get("max_trades", 150),
+            bev_trigger=args_dict.get("bev_trigger", 2.0),
+            bev_buffer=args_dict.get("bev_buffer", 1.0),
+            bev_buffer_mode=args_dict.get("bev_buffer_mode", "rupees"),
+            straight_down_pct=args_dict.get("wide_stop", 25.0),
+            start_time=args_dict.get("start_time", "09:15"),
+            end_time=args_dict.get("end_time", "15:30"),
+            fut_move_limit=fml,
+            opt_open_rally_pct=args_dict.get("open_rally", 50),
+            opt_atp_distance_pct=args_dict.get("atp_distance", 30),
+            opt_buy_sell_ratio=args_dict.get("bs_ratio", 0.0),
+            rally_base=args_dict.get("rally_base", "daylow_prevclose"),
+            quiet=True, verbose=False,
+            opt_momentum_threshold=args_dict.get("momentum_threshold", 1.0),
+            first_only=args_dict.get("first_only", False),
+            target_profit=args_dict.get("target_profit", 0),
+            require_lower_wick=args_dict.get("require_lower_wick", False),
+            block_marubozu=args_dict.get("block_marubozu", 0),
+            max_hold=args_dict.get("max_hold", 0),
+            max_range=args_dict.get("max_range", 0),
+            max_momentum=args_dict.get("max_momentum", 0),
+            max_above_high=args_dict.get("max_above_high", 0),
+            rebuy_drop=args_dict.get("rebuy_drop", 0),
+            min_premium=mn, max_premium=mx,
+            side_filter=args_dict.get("side", "BOTH"),
+            minute_interval=args_dict.get("minute_interval", 0),
+        )
+        if result:
+            result["date"] = date_str
+            result["strike"] = combo.get("strike", "")
+            result["underlying"] = combo.get("underlying", "")
+            results.append(result)
     
-    result = run_backtest(
-        combo["ce_path"], combo["pe_path"], combo["fut_path"],
-        combo["ce_info"], combo["pe_info"], combo["fut_info"],
-        opt_low_margin=args_dict.get("opt_margin", 5),
-        fut_low_margin=args_dict.get("fut_margin", 10),
-        trail_tiers=trail_tiers,
-        max_trades=args_dict.get("max_trades", 150),
-        bev_trigger=args_dict.get("bev_trigger", 2.0),
-        bev_buffer=args_dict.get("bev_buffer", 1.0),
-        bev_buffer_mode=args_dict.get("bev_buffer_mode", "rupees"),
-        straight_down_pct=args_dict.get("wide_stop", 25.0),
-        start_time=args_dict.get("start_time", "09:15"),
-        end_time=args_dict.get("end_time", "15:30"),
-        fut_move_limit=fml,
-        opt_open_rally_pct=args_dict.get("open_rally", 50),
-        opt_atp_distance_pct=args_dict.get("atp_distance", 30),
-        opt_buy_sell_ratio=args_dict.get("bs_ratio", 0.0),
-        rally_base=args_dict.get("rally_base", "daylow_prevclose"),
-        quiet=True,
-        verbose=False,
-        opt_momentum_threshold=args_dict.get("momentum_threshold", 1.0),
-        first_only=args_dict.get("first_only", False),
-        target_profit=args_dict.get("target_profit", 0),
-        require_lower_wick=args_dict.get("require_lower_wick", False),
-        block_marubozu=args_dict.get("block_marubozu", 0),
-        max_hold=args_dict.get("max_hold", 0),
-        max_range=args_dict.get("max_range", 0),
-        max_momentum=args_dict.get("max_momentum", 0),
-        max_above_high=args_dict.get("max_above_high", 0),
-        rebuy_drop=args_dict.get("rebuy_drop", 0),
-        min_premium=args_dict.get("min_premium", 0),
-        max_premium=args_dict.get("max_premium", 0),
-        side_filter=args_dict.get("side", "BOTH"),
-    )
-    return result
+    elapsed = time.time() - t0
+    return {"date": date_str, "results": results, "elapsed": elapsed, "combos_run": len(combos)}
 
 
 def main():
@@ -1742,6 +1836,8 @@ def main():
     parser.add_argument("--momentum-threshold", type=float, default=1.0, help="Option LTP must exceed prev avg by this Rs (default 1.0)")
     parser.add_argument("--atm-only", action="store_true", help="Only test ATM ± atm-range strikes (auto-detected from future price)")
     parser.add_argument("--atm-range", type=int, default=500, help="Strike range around ATM to test (default ±500)")
+    parser.add_argument("--nearest-expiry", action="store_true", help="Keep only nearest expiry per underlying")
+    parser.add_argument("--single-atm", action="store_true", help="Pick ONE combo per underlying (nearest expiry, closest strike)")
     parser.add_argument("--min-premium", type=float, default=0, help="Skip buy if option LTP < this Rs (0=off)")
     parser.add_argument("--max-premium", type=float, default=0, help="Skip buy if option LTP > this Rs (0=off)")
     parser.add_argument("--bnf-min-premium", type=float, default=0, help="BankNifty min premium (overrides --min-premium for BNF)")
@@ -1749,7 +1845,7 @@ def main():
     parser.add_argument("--nif-min-premium", type=float, default=0, help="Nifty/Sensex min premium (overrides --min-premium for NIF/SEN)")
     parser.add_argument("--nif-max-premium", type=float, default=0, help="Nifty/Sensex max premium (overrides --max-premium for NIF/SEN)")
     parser.add_argument("--side", type=str, default="BOTH", choices=["CE","PE","BOTH"], help="Trade only CE, only PE, or BOTH (default BOTH)")
-    parser.add_argument("--parallel", type=int, default=4, help="Run N combos in parallel (0=sequential, 4=recommended)")
+    parser.add_argument("--parallel", type=int, default=0, help="Run N combos in parallel (0=sequential, 4=recommended)")
     parser.add_argument("--first-only", action="store_true", help="Only take first trade per day per side, hold until --target-profit or EOD")
     parser.add_argument("--target-profit", type=float, default=0, help="Target profit %% to sell (0=use trail/stop as normal, 40=sell at +40%%)")
     parser.add_argument("--require-lower-wick", action="store_true", help="Only buy if prev minute candle has a lower wick (proven support)")
@@ -1914,12 +2010,18 @@ def main():
     # Run backtests
     all_results = []
 
+    _t_total_start = time.perf_counter()
+    pending_days = []
+
     for date_str, day_path, _ in selected_dates:
         print(f"\n{'━' * 62}")
         print(f"  📅 {date_str}")
         print(f"{'━' * 62}")
 
+        _t0 = time.perf_counter()
         instruments = scan_instruments(day_path)
+        _t_scan = time.perf_counter() - _t0
+        print(f"  ⏱ scan: {_t_scan:.1f}s", flush=True)
         combos = find_combos(instruments)
 
         if not combos:
@@ -1950,6 +2052,7 @@ def main():
                 print(f"  Weekly filter: using expiry {nearest}")
 
         # ── ATM-only filter: detect market level from future, filter strikes ──
+        _t0 = time.perf_counter()
         if args.atm_only and combos:
             atm_range = args.atm_range
             # Detect ATM level per underlying (BN, NF, SX have different levels)
@@ -1973,8 +2076,7 @@ def main():
                                     if ltp and float(ltp) > 0:
                                         underlying_levels[ul] = float(ltp)
                                         break
-                                except:
-                                    continue
+                                except: continue
                         else:
                             with open(fp) as ff:
                                 for fline in ff:
@@ -1987,8 +2089,7 @@ def main():
                                         if ltp and float(ltp) > 0:
                                             underlying_levels[ul] = float(ltp)
                                             break
-                                    except:
-                                        continue
+                                    except: continue
                     except:
                         pass
 
@@ -2007,8 +2108,124 @@ def main():
                 for ul, level in underlying_levels.items():
                     print(f"  ATM filter: {ul} ~{level:.0f}, strikes {level-atm_range:.0f}-{level+atm_range:.0f}")
                 print(f"  ATM filter: {before} → {len(combos)} combos")
+                for ul, lvl in sorted(underlying_levels.items()):
+                    ul_count = sum(1 for c in combos if c.get("underlying") == ul)
+                    print(f"    {ul}: future ~{lvl:.0f}, {ul_count} strikes kept")
             else:
                 print(f"  ⚠ ATM filter: couldn't read any future prices, skipping filter")
+
+        _t_atm = time.perf_counter() - _t0
+        print(f"  ⏱ ATM + filters: {_t_atm:.1f}s", flush=True)
+
+        # --nearest-expiry or --single-atm: keep only nearest expiry per underlying
+        if getattr(args, 'nearest_expiry', False) or getattr(args, 'single_atm', False):
+            by_ul = {}
+            for c in combos:
+                ul = c.get("underlying", "")
+                if ul not in by_ul: by_ul[ul] = []
+                by_ul[ul].append(c)
+            nearest_combos = []
+            for ul, ul_combos in by_ul.items():
+                expiries = sorted(set(c.get("expiry", "9999") for c in ul_combos))
+                nearest_exp = expiries[0]
+                if nearest_exp == date_str and len(expiries) > 1:
+                    print(f"  ⚠ {ul}: expiry day {nearest_exp}, using next: {expiries[1]}")
+                    nearest_exp = expiries[1]
+                filtered = [c for c in ul_combos if c.get("expiry") == nearest_exp]
+                nearest_combos.extend(filtered)
+                print(f"  Nearest expiry: {ul} → {nearest_exp} ({len(filtered)} strikes)")
+            before_ne = len(combos)
+            combos = nearest_combos
+            print(f"  Nearest expiry: {before_ne} → {len(combos)} combos")
+
+        # --single-atm: pick ONE combo per underlying (closest strike to ATM)
+        if getattr(args, 'single_atm', False) and underlying_levels:
+            by_ul2 = {}
+            for c in combos:
+                ul = c.get("underlying", "")
+                if ul not in by_ul2: by_ul2[ul] = []
+                by_ul2[ul].append(c)
+            best_combos = []
+            for ul, ul_combos in by_ul2.items():
+                atm = underlying_levels.get(ul, 0)
+                best = min(ul_combos, key=lambda c: abs(float(c.get("strike", 0)) - atm))
+                best_combos.append(best)
+                print(f"  Single ATM: {ul} → strike {best['strike']} (fut ~{atm:.0f})")
+            before_sa = len(combos)
+            combos = best_combos
+            print(f"  Single ATM: {before_sa} → {len(combos)} combos")
+
+
+        def _get_premium(combo, args, which):
+            """Get min/max premium for this combo's underlying."""
+            ul = combo.get("underlying", "").upper()
+            if which == 'min':
+                if ("BANKNIFTY" in ul or "BANKEX" in ul) and getattr(args, 'bnf_min_premium', 0) > 0:
+                    return args.bnf_min_premium
+                if ("NIFTY" in ul or "SENSEX" in ul) and "BANK" not in ul and getattr(args, 'nif_min_premium', 0) > 0:
+                    return args.nif_min_premium
+                return getattr(args, 'min_premium', 0)
+            else:
+                if ("BANKNIFTY" in ul or "BANKEX" in ul) and getattr(args, 'bnf_max_premium', 0) > 0:
+                    return args.bnf_max_premium
+                if ("NIFTY" in ul or "SENSEX" in ul) and "BANK" not in ul and getattr(args, 'nif_max_premium', 0) > 0:
+                    return args.nif_max_premium
+                return getattr(args, 'max_premium', 0)
+
+        # Premium pre-filter: skip combos where option LTP is way outside range
+        if combos and (getattr(args, 'bnf_min_premium', 0) > 0 or getattr(args, 'nif_min_premium', 0) > 0
+                      or getattr(args, 'min_premium', 0) > 0 or getattr(args, 'max_premium', 0) > 0):
+            before_pf = len(combos)
+            kept = []
+            skipped = 0
+            side = getattr(args, 'side', 'BOTH')
+            for c in combos:
+                mn = _get_premium(c, args, 'min')
+                mx = _get_premium(c, args, 'max')
+                if mn <= 0 and mx <= 0:
+                    kept.append(c)
+                    continue
+                paths = []
+                if side == "PE": paths = [c.get("pe_path")]
+                elif side == "CE": paths = [c.get("ce_path")]
+                else: paths = [c.get("ce_path"), c.get("pe_path")]
+                any_ok = False
+                checked = False
+                for p in paths:
+                    if not p: continue
+                    try:
+                        if p.endswith(".parquet"):
+                            import pyarrow.parquet as pq
+                            pf = pq.ParquetFile(p)
+                            batch = pf.read_row_group(0, columns=["raw"])
+                            for raw in batch.column("raw").to_pylist()[:20]:
+                                rec = json.loads(raw)
+                                ltp = extract_ltp(rec.get("data", rec))
+                                if ltp and float(ltp) > 0:
+                                    checked = True
+                                    if not (mx > 0 and float(ltp) > mx * 1.1) and not (mn > 0 and float(ltp) < mn * 0.9):
+                                        any_ok = True
+                                    break
+                        else:
+                            with open(p) as ff:
+                                for fline in ff:
+                                    fline = fline.strip()
+                                    if not fline: continue
+                                    rec = json.loads(fline)
+                                    ltp = extract_ltp(rec.get("data", rec))
+                                    if ltp and float(ltp) > 0:
+                                        checked = True
+                                        if not (mx > 0 and float(ltp) > mx * 1.1) and not (mn > 0 and float(ltp) < mn * 0.9):
+                                            any_ok = True
+                                        break
+                    except: pass
+                if not checked or any_ok:
+                    kept.append(c)
+                else:
+                    skipped += 1
+            combos = kept
+            if skipped > 0:
+                print(f"  Premium pre-filter: skipped {skipped}, {len(combos)} remaining")
         if args.min_price > 0 or args.max_price < 99999:
             print(f"  Price filter: ₹{args.min_price}-{args.max_price} (applied during trade)")
 
@@ -2039,21 +2256,6 @@ def main():
                 except (ValueError, IndexError):
                     selected_combos = combos
 
-        def _get_premium(combo, args, which):
-            """Get min/max premium for this combo's underlying."""
-            ul = combo.get("underlying", "").upper()
-            if which == 'min':
-                if ("BANKNIFTY" in ul or "BANKEX" in ul) and getattr(args, 'bnf_min_premium', 0) > 0:
-                    return args.bnf_min_premium
-                if ("NIFTY" in ul or "SENSEX" in ul) and "BANK" not in ul and getattr(args, 'nif_min_premium', 0) > 0:
-                    return args.nif_min_premium
-                return getattr(args, 'min_premium', 0)
-            else:
-                if ("BANKNIFTY" in ul or "BANKEX" in ul) and getattr(args, 'bnf_max_premium', 0) > 0:
-                    return args.bnf_max_premium
-                if ("NIFTY" in ul or "SENSEX" in ul) and "BANK" not in ul and getattr(args, 'nif_max_premium', 0) > 0:
-                    return args.nif_max_premium
-                return getattr(args, 'max_premium', 0)
 
         def _run_one_combo(combo):
             """Run backtest on a single combo. Returns result dict or None."""
@@ -2074,7 +2276,7 @@ def main():
                     breakout_pts=args.breakout_pts,
                     stop_pct=args.stop_pct,
                     target_pct=args.target_pct,
-                    quiet=True,
+                    quiet=(args.parallel > 0),
                 )
             else:
                 return run_backtest(
@@ -2095,8 +2297,7 @@ def main():
                     opt_atp_distance_pct=args.atp_distance,
                     opt_buy_sell_ratio=args.bs_ratio,
                     rally_base=args.rally_base,
-                    quiet=_quiet_mode,
-                    verbose=args.verbose and not _quiet_mode,
+                    verbose=args.verbose,
                     minute_interval=args.minute_interval,
                     opt_momentum_threshold=args.momentum_threshold,
                     first_only=args.first_only,
@@ -2111,83 +2312,116 @@ def main():
                     min_premium=_get_premium(combo, args, 'min'),
                     max_premium=_get_premium(combo, args, 'max'),
                     side_filter=getattr(args, 'side', 'BOTH'),
+                    quiet=(args.parallel > 0),
                 )
 
-        clear_tick_cache()  # free memory from previous day
         if args.parallel > 0 and len(selected_combos) > 1 and not args.verbose:
-            # Parallel execution — quiet during run, print results after
-            from concurrent.futures import ThreadPoolExecutor, as_completed
             _quiet_mode = True
-            print(f"  Running {len(selected_combos)} combos in parallel ({args.parallel} workers, multi-process)...", flush=True)
-            parallel_results = []
-
-            # Pack args into a picklable dict for process workers
+            # Queue this day for parallel execution later
             trail_str = ";".join(f"{a},{b}" for a,b in trail_tiers) if trail_tiers else ""
-            args_dict = {
-                "opt_margin": args.opt_margin, "fut_margin": args.fut_margin,
-                "trail_tiers": trail_str, "max_trades": args.max_trades,
-                "bev_trigger": args.bev_trigger, "bev_buffer": args.bev_buffer,
-                "bev_buffer_mode": args.bev_buffer_mode, "wide_stop": args.wide_stop,
-                "start_time": args.start_time, "end_time": args.end_time,
-                "fut_move_limit": args.fut_move_limit,
-                "open_rally": args.open_rally, "atp_distance": args.atp_distance,
-                "bs_ratio": args.bs_ratio, "rally_base": args.rally_base,
-                "momentum_threshold": args.momentum_threshold,
-                "first_only": args.first_only, "target_profit": args.target_profit,
-                "require_lower_wick": args.require_lower_wick,
-                "block_marubozu": args.block_marubozu, "max_hold": args.max_hold,
-                "max_range": args.max_range, "max_momentum": args.max_momentum,
-                "max_above_high": args.max_above_high, "rebuy_drop": args.rebuy_drop,
-                "min_premium": _get_premium(selected_combos[0], args, 'min') if selected_combos else 0,
-                "max_premium": _get_premium(selected_combos[0], args, 'max') if selected_combos else 0,
-                "side": getattr(args, 'side', 'BOTH'),
+            day_work = {
+                "date": date_str, "day_path": day_path,
+                "combos": selected_combos,
+                "args": {
+                    "opt_margin": args.opt_margin, "fut_margin": args.fut_margin,
+                    "trail_tiers": trail_str, "max_trades": args.max_trades,
+                    "bev_trigger": args.bev_trigger, "bev_buffer": args.bev_buffer,
+                    "bev_buffer_mode": args.bev_buffer_mode, "wide_stop": args.wide_stop,
+                    "start_time": args.start_time, "end_time": args.end_time,
+                    "fut_move_limit": args.fut_move_limit,
+                    "open_rally": args.open_rally, "atp_distance": args.atp_distance,
+                    "bs_ratio": args.bs_ratio, "rally_base": args.rally_base,
+                    "momentum_threshold": args.momentum_threshold,
+                    "first_only": args.first_only, "target_profit": args.target_profit,
+                    "require_lower_wick": args.require_lower_wick,
+                    "block_marubozu": args.block_marubozu, "max_hold": args.max_hold,
+                    "max_range": args.max_range, "max_momentum": args.max_momentum,
+                    "max_above_high": args.max_above_high, "rebuy_drop": args.rebuy_drop,
+                    "min_premium": getattr(args, 'min_premium', 0),
+                    "max_premium": getattr(args, 'max_premium', 0),
+                    "bnf_min_premium": getattr(args, 'bnf_min_premium', 0),
+                    "bnf_max_premium": getattr(args, 'bnf_max_premium', 0),
+                    "nif_min_premium": getattr(args, 'nif_min_premium', 0),
+                    "nif_max_premium": getattr(args, 'nif_max_premium', 0),
+                    "side": getattr(args, 'side', 'BOTH'),
+                    "minute_interval": getattr(args, 'minute_interval', 0),
+                    "strategy": getattr(args, 'strategy', 'momentum'),
+                },
             }
-
-            # Build per-combo work items with correct per-underlying premium
-            work_items = []
-            for c in selected_combos:
-                item_args = dict(args_dict)
-                item_args["min_premium"] = _get_premium(c, args, 'min')
-                item_args["max_premium"] = _get_premium(c, args, 'max')
-                work_items.append({"combo": c, "args": item_args})
-
-            from concurrent.futures import ProcessPoolExecutor, as_completed
-            with ProcessPoolExecutor(max_workers=min(args.parallel, len(selected_combos))) as pool:
-                futures = {pool.submit(_parallel_worker, w): w["combo"] for w in work_items}
-                done = 0
-                for future in as_completed(futures):
-                    done += 1
-                    combo = futures[future]
-                    try:
-                        result = future.result()
-                        if result:
-                            result["date"] = date_str
-                            result["strike"] = combo["strike"]
-                            result["underlying"] = combo["underlying"]
-                            parallel_results.append(result)
-                    except Exception as e:
-                        print(f"  ⚠ Error on {combo.get('underlying','')} {combo.get('strike','')}: {e}")
-                    if done % 5 == 0 or done == len(selected_combos):
-                        print(f"    [{done}/{len(selected_combos)}] {done/len(selected_combos)*100:.0f}% done", flush=True)
-
-            # Step 3: Print results — sorted, clean, complete
-            parallel_results.sort(key=lambda x: (x.get("underlying",""), str(x.get("strike",""))))
-
-            for result in parallel_results:
-                all_results.append(result)
-                print_result(result, show_trades=not args.no_trades)
+            pending_days.append(day_work)
+            print(f"  Queued {len(selected_combos)} combos for parallel", flush=True)
         else:
             # Sequential execution
-            _quiet_mode = False
             clear_tick_cache()
-        for combo in selected_combos:
+            day_results = []
+            _t_day_start = time.perf_counter()
+            # Track which FUT files to keep in cache (shared across combos)
+            _fut_paths = set(c.get("fut_path","") for c in selected_combos)
+            for ci, combo in enumerate(selected_combos, 1):
+                # Clear CE/PE from cache between combos (keep FUT — shared)
+                if ci > 1:
+                    stale = [k for k in _tick_cache if k not in _fut_paths]
+                    for k in stale:
+                        del _tick_cache[k]
+                print(f"\n  [{ci}/{len(selected_combos)}] {combo.get('underlying','')} {combo.get('strike','')} exp={combo.get('expiry','')}", flush=True)
+                _t_combo = time.perf_counter()
                 result = _run_one_combo(combo)
+                _t_combo_done = time.perf_counter() - _t_combo
+                print(f"    ⏱ {_t_combo_done:.1f}s", flush=True)
                 if result:
                     result["date"] = date_str
                     result["strike"] = combo["strike"]
                     result["underlying"] = combo["underlying"]
                     all_results.append(result)
+                    day_results.append(result)
                     print_result(result, show_trades=not args.no_trades)
+            # Day summary
+            if day_results:
+                day_trades = sum(r.get("ce_count",0) + r.get("pe_count",0) for r in day_results)
+                day_wins = sum(r.get("ce_wins",0) + r.get("pe_wins",0) for r in day_results)
+                day_pnl = sum(r.get("total_pnl",0) for r in day_results)
+                day_mark = "✓" if day_pnl > 0 else "✗"
+                print(f"\n  {'━'*50}")
+                print(f"  📊 DAY TOTAL {date_str}: {day_trades} trades, {day_wins} wins, {day_mark} Rs{day_pnl:+,.2f}")
+                _t_day_elapsed = time.perf_counter() - _t_day_start
+                print(f"  ⏱ Day: {_t_day_elapsed:.1f}s total, {_t_day_elapsed/max(len(selected_combos),1):.1f}s per combo")
+                print(f"  {'━'*50}")
+
+
+    # Execute queued days in parallel (ProcessPool — true multi-core)
+    if pending_days:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        n_workers = min(args.parallel, len(pending_days))
+        print(f"\n  Running {len(pending_days)} days in parallel ({n_workers} processes)...", flush=True)
+        
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_process_one_day, dw): dw["date"] for dw in pending_days}
+            for future in as_completed(futures):
+                day_date = futures[future]
+                try:
+                    day_result = future.result()
+                    n_results = len(day_result["results"])
+                    elapsed = day_result["elapsed"]
+                    print(f"  ✓ {day_date}: {day_result['combos_run']} combos, {n_results} with trades, {elapsed:.0f}s", flush=True)
+                    day_pnl = 0
+                    day_trades = 0
+                    day_wins = 0
+                    for result in day_result["results"]:
+                        all_results.append(result)
+                        print_result(result, show_trades=not args.no_trades)
+                        day_trades += result.get("ce_count",0) + result.get("pe_count",0)
+                        day_wins += result.get("ce_wins",0) + result.get("pe_wins",0)
+                        day_pnl += result.get("total_pnl",0)
+                    if day_result["results"]:
+                        day_mark = "✓" if day_pnl > 0 else "✗"
+                        print(f"\n  {'━'*50}")
+                        print(f"  📊 DAY TOTAL {day_date}: {day_trades} trades, {day_wins} wins, {day_mark} Rs{day_pnl:+,.2f}")
+                        print(f"  {'━'*50}")
+                except Exception as e:
+                    print(f"  ⚠ {day_date}: Error — {e}", flush=True)
+
+    _t_total_end = time.perf_counter()
+    print(f"\n  ⏱ TOTAL RUN TIME: {_t_total_end - _t_total_start:.0f}s ({(_t_total_end - _t_total_start)/60:.1f} min)", flush=True)
 
     # Multi-date summary
     if len(all_results) > 1:
