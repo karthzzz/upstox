@@ -67,8 +67,9 @@ def extract_fields(raw_json):
             if ltpc.get("cp") is not None:
                 cp = float(ltpc["cp"])
             
-            # OHLC
+            # OHLC — handle both formats
             ohlc_data = mff.get("marketOHLC") or mff.get("ohlc") or {}
+            # Format 1: separate arrays — ohlc_data['open'][0]['price']
             for field, var in [("open", "o"), ("high", "h"), ("low", "l"), ("close", "c")]:
                 arr = ohlc_data.get(field)
                 if isinstance(arr, list) and arr:
@@ -80,13 +81,28 @@ def extract_fields(raw_json):
                         elif var == "h": h = float(val)
                         elif var == "l": l = float(val)
                         elif var == "c": c = float(val)
+            # Format 2: ohlc array — ohlc_data['ohlc'][0] = {open:X, high:Y, ...}
+            if o is None:
+                ohlc_arr = ohlc_data.get("ohlc")
+                if isinstance(ohlc_arr, list) and ohlc_arr:
+                    # Use first item (usually '1d' interval)
+                    item = ohlc_arr[0]
+                    if isinstance(item, dict):
+                        if item.get("open") is not None: o = float(item["open"])
+                        if item.get("high") is not None: h = float(item["high"])
+                        if item.get("low") is not None: l = float(item["low"])
+                        if item.get("close") is not None: c = float(item["close"])
             
-            # Market data
+            # Market data — check eFeedDetails first, then mff directly
             efd = mff.get("eFeedDetails") or mff.get("efeedDetails") or mff.get("marketData") or {}
             if efd.get("atp") is not None: atp = float(efd["atp"])
+            elif mff.get("atp") is not None: atp = float(mff["atp"])
             if efd.get("tbq") is not None: tbq = float(efd["tbq"])
+            elif mff.get("tbq") is not None: tbq = float(mff["tbq"])
             if efd.get("tsq") is not None: tsq = float(efd["tsq"])
+            elif mff.get("tsq") is not None: tsq = float(mff["tsq"])
             if efd.get("oi") is not None: oi = float(efd["oi"])
+            elif mff.get("oi") is not None: oi = float(mff["oi"])
             
             # Greeks
             greeks = mff.get("optionGreeks") or mff.get("option_greeks") or {}
@@ -95,13 +111,20 @@ def extract_fields(raw_json):
             if greeks.get("gamma") is not None: gamma = float(greeks["gamma"])
             if greeks.get("vega") is not None: vega = float(greeks["vega"])
             if greeks.get("iv") is not None: iv = float(greeks["iv"])
+            elif mff.get("iv") is not None: iv = float(mff["iv"])
             
-            # Bid/Ask
+            # Bid/Ask — handle both formats
             ml = mff.get("marketLevel") or {}
             bids = ml.get("bidPrices") or []
             asks = ml.get("askPrices") or []
             if bids: bid = float(bids[0]) if not isinstance(bids[0], dict) else float(bids[0].get("price", 0))
             if asks: ask = float(asks[0]) if not isinstance(asks[0], dict) else float(asks[0].get("price", 0))
+            # Format 2: bidAskQuote array
+            if bid is None:
+                baq = ml.get("bidAskQuote") or []
+                if baq and isinstance(baq[0], dict):
+                    if baq[0].get("bidP") is not None: bid = float(baq[0]["bidP"])
+                    if baq[0].get("askP") is not None: ask = float(baq[0]["askP"])
             
             break
         if ltp is not None:
